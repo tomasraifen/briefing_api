@@ -299,10 +299,14 @@ def enrich_apollo_batch(batch_size: int = Query(default=5, ge=1, le=20)):
 @router.patch("/{lead_id}/estado")
 def update_apollo_estado(lead_id: int, estado: str, intento_id: Optional[int] = None):
     """
-    Actualiza el estado de un lead Apollo.
-    Estados válidos: pendiente | enviado | bounce | reply | sin_contacto
+    Actualiza el estado de un lead Apollo manualmente (uso administrativo/debug — el flujo normal
+    lo maneja prepare_apollo/mark_sent/mark_bounces).
+    Estados válidos: pendiente | en_cola | contactado | seguimiento_enviado | bounce | reply | sin_contacto | descartado
     """
-    estados_validos = {'pendiente', 'enviado', 'bounce', 'reply', 'sin_contacto'}
+    estados_validos = {
+        'pendiente', 'en_cola', 'contactado', 'seguimiento_enviado',
+        'bounce', 'reply', 'sin_contacto', 'descartado'
+    }
     if estado not in estados_validos:
         raise HTTPException(status_code=400, detail=f"Estado inválido. Válidos: {estados_validos}")
 
@@ -310,7 +314,7 @@ def update_apollo_estado(lead_id: int, estado: str, intento_id: Optional[int] = 
         """
         UPDATE apollo_leads
         SET estado = %s,
-            contactado_at = CASE WHEN %s = 'enviado' THEN NOW() ELSE contactado_at END,
+            contactado_at = CASE WHEN %s = 'contactado' THEN NOW() ELSE contactado_at END,
             outreach_intento_id = COALESCE(%s, outreach_intento_id)
         WHERE id = %s
         """,
@@ -326,9 +330,13 @@ def apollo_stats():
         """
         SELECT
             COUNT(*) FILTER (WHERE estado = 'pendiente') AS pendientes,
-            COUNT(*) FILTER (WHERE estado = 'enviado') AS enviados,
+            COUNT(*) FILTER (WHERE estado = 'en_cola') AS en_cola,
+            COUNT(*) FILTER (WHERE estado = 'contactado') AS contactados,
+            COUNT(*) FILTER (WHERE estado = 'seguimiento_enviado') AS seguimientos_enviados,
             COUNT(*) FILTER (WHERE estado = 'bounce') AS bounces,
             COUNT(*) FILTER (WHERE estado = 'reply') AS replies,
+            COUNT(*) FILTER (WHERE estado = 'sin_contacto') AS sin_contacto,
+            COUNT(*) FILTER (WHERE estado = 'descartado') AS descartados,
             COUNT(*) FILTER (WHERE mensaje_intro IS NULL) AS sin_intro,
             COUNT(*) AS total
         FROM apollo_leads

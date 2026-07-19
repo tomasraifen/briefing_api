@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from datetime import datetime, timedelta
 from typing import Optional
 from pydantic import BaseModel
@@ -58,26 +58,48 @@ def mark_sent(req: MarkSentRequest):
     Marca un intento como enviado tras el envío por Gmail API.
     Incrementa el contador emails_enviados en message_matrix (si el intento tiene matrix_id asociado).
 
+    Acá — y solo acá — es donde apollo_leads.estado pasa a reflejar un envío REAL confirmado
+    ('contactado' si era primer_contacto, 'seguimiento_enviado' si era seguimiento). prepare_apollo
+    solo deja el lead en 'en_cola' porque en ese momento el mensaje todavía no salió — evita que
+    planner_batch lo tome dos veces mientras espera su turno en el Dispatcher.
+
     Usado por el Flujo B (Dispatcher) después de cada envío exitoso.
     """
     intento = fetch_one(
-        "SELECT id, matrix_id FROM outreach_intentos WHERE id = %s",
+        "SELECT id, tipo, matrix_id FROM outreach_intentos WHERE id = %s",
         (req.intento_id,)
     )
     if not intento:
         raise HTTPException(status_code=404, detail=f"Intento {req.intento_id} no encontrado")
 
+    ahora = datetime.utcnow()
     execute(
         """
         UPDATE outreach_intentos
         SET estado = 'enviado', enviado_at = %s, instantly_id = %s
         WHERE id = %s
         """,
-        (datetime.utcnow(), req.instantly_id or '', req.intento_id)
+        (ahora, req.instantly_id or '', req.intento_id)
     )
 
     if intento['matrix_id']:
         increment_sent(intento['matrix_id'])
+
+    apollo_lead = fetch_one(
+        "SELECT id FROM apollo_leads WHERE outreach_intento_id = %s",
+        (req.intento_id,)
+    )
+    if apollo_lead:
+        if intento['tipo'] == 'seguimiento':
+            execute(
+                "UPDATE apollo_leads SET estado = 'seguimiento_enviado' WHERE id = %s",
+                (apollo_lead['id'],)
+            )
+        else:
+            execute(
+                "UPDATE apollo_leads SET estado = 'contactado', contactado_at = %s WHERE id = %s",
+                (ahora, apollo_lead['id'])
+            )
 
     return {"status": "ok", "intento_id": req.intento_id}
 
@@ -85,6 +107,8 @@ def mark_sent(req: MarkSentRequest):
 DAILY_CAP = 15
 BUFFER_DIAS_HABILES = 5
 MAX_POR_CORRIDA = 30  # tope de leads a generar en una sola corrida del Planner
+DIAS_HABILES_ANTES_SEGUIMIENTO = 7  # espera antes de considerar un lead elegible para seguimiento
+MAX_SEGUIMIENTOS = 1  # por ahora, uno solo por lead — lo garantiza el filtro por estado
 
 # Países reales en apollo_leads (verificado contra la BD 2026-07-09) → código Nager.Date
 PAIS_A_CODIGO = {
@@ -118,7 +142,7 @@ def _festivos_por_pais(anios: set[int]) -> dict:
 
 
 @router.get("/planner_batch")
-def planner_batch():
+def planner_batch(tipo: str = Query(default="primer_contacto", pattern="^(primer_contacto|seguimiento)$")):
     """
     Devuelve el batch completo ya armado para el Planner (Flujo A): cada lead viene con su
     programado_para asignado, respetando festivos por país (Nager.Date, por lead — no un solo
@@ -135,6 +159,12 @@ def planner_batch():
     corrida fallida, la siguiente corrida lo rellena primero antes de extender el horizonte hacia
     adelante — el Planner nunca programa "hoy", solo hacia el futuro, y el Dispatcher solo envía
     lo que ya está programado.
+
+    tipo=seguimiento: en vez de leads sin contactar, trae leads con estado='contactado' que ya
+    pasaron DIAS_HABILES_ANTES_SEGUIMIENTO días hábiles desde contactado_at y todavía no
+    respondieron ni recibieron seguimiento. Incluye primer_contacto_asunto/cuerpo en cada lead
+    para que Gemini pueda referenciar lo que ya se le escribió, en vez de inventar un mensaje
+    sin contexto. La misma lógica de festivos/cupo/buffer aplica para ambos tipos.
     """
     hoy = datetime.utcnow().date()
     anios = {hoy.year, (hoy + timedelta(days=BUFFER_DIAS_HABILES * 3)).year}
@@ -162,11 +192,11 @@ def planner_batch():
             """
             SELECT COUNT(*) AS n
             FROM outreach_intentos
-            WHERE lead_id IS NULL AND tipo = 'primer_contacto'
+            WHERE lead_id IS NULL AND tipo = %s
               AND estado IN ('pendiente', 'enviado')
               AND programado_para::date = %s
             """,
-            (candidato,)
+            (tipo, candidato)
         )
         ya_agendados = result['n'] if result else 0
         cupo = DAILY_CAP - ya_agendados
@@ -183,15 +213,33 @@ def planner_batch():
         dias_plan.append({"fecha": extra, "cupo": min(DAILY_CAP, MAX_POR_CORRIDA), "paises": paises_habiles})
 
     # Traer candidatos de sobra para poder repartir por país sin quedarnos cortos
-    pendientes = fetch_all(
-        """
-        SELECT id, apollo_id, nombre_decisor, cargo, email, empresa, vertical,
-               pais, ciudad, empleados, stack_categoria, tech_stack_apollo,
-               tech_stack_wappalyzer, company_brief, news_snippet, apollo_score_angulo
-        FROM apollo_leads WHERE estado = 'pendiente' LIMIT 500
-        """,
-        ()
-    )
+    if tipo == "seguimiento":
+        pendientes = fetch_all(
+            f"""
+            SELECT id, apollo_id, nombre_decisor, cargo, email, empresa, vertical,
+                   pais, ciudad, empleados, stack_categoria, tech_stack_apollo,
+                   tech_stack_wappalyzer, company_brief, news_snippet, apollo_score_angulo,
+                   primer_contacto_asunto, primer_contacto_cuerpo
+            FROM apollo_leads
+            WHERE estado = 'contactado'
+              AND (
+                SELECT COUNT(*) FROM generate_series(contactado_at::date + 1, CURRENT_DATE, interval '1 day') d
+                WHERE EXTRACT(DOW FROM d) NOT IN (0, 6)
+              ) >= {DIAS_HABILES_ANTES_SEGUIMIENTO}
+            LIMIT 500
+            """,
+            ()
+        )
+    else:
+        pendientes = fetch_all(
+            """
+            SELECT id, apollo_id, nombre_decisor, cargo, email, empresa, vertical,
+                   pais, ciudad, empleados, stack_categoria, tech_stack_apollo,
+                   tech_stack_wappalyzer, company_brief, news_snippet, apollo_score_angulo
+            FROM apollo_leads WHERE estado = 'pendiente' LIMIT 500
+            """,
+            ()
+        )
 
     asignados = []
     sin_dia_habil = 0
@@ -243,12 +291,15 @@ def prepare_outreach_apollo(req: dict):
     if len(email_cuerpo) < 50:
         raise HTTPException(status_code=422, detail="email_cuerpo es obligatorio (generado por Gemini)")
 
+    # El estado esperado del lead depende del tipo: primer_contacto parte de 'pendiente',
+    # seguimiento parte de 'contactado' (ya se le mandó el primer_contacto hace rato).
+    estado_esperado = 'contactado' if tipo == 'seguimiento' else 'pendiente'
     lead = fetch_one(
-        "SELECT * FROM apollo_leads WHERE id = %s AND estado = 'pendiente'",
-        (apollo_lead_id,)
+        "SELECT * FROM apollo_leads WHERE id = %s AND estado = %s",
+        (apollo_lead_id, estado_esperado)
     )
     if not lead:
-        raise HTTPException(status_code=404, detail=f"Apollo lead {apollo_lead_id} no encontrado o ya procesado")
+        raise HTTPException(status_code=404, detail=f"Apollo lead {apollo_lead_id} no encontrado o no está en estado '{estado_esperado}' para tipo={tipo}")
 
     programado_para_raw = req.get("programado_para")
     ahora = datetime.utcnow()
@@ -272,10 +323,25 @@ def prepare_outreach_apollo(req: dict):
     )
     intento_id = result['id']
 
-    execute(
-        "UPDATE apollo_leads SET outreach_intento_id = %s, estado = 'enviado', contactado_at = %s WHERE id = %s",
-        (intento_id, ahora, apollo_lead_id)
-    )
+    # 'en_cola', no 'enviado' — todavía no lo mandó el Dispatcher. Evita que planner_batch
+    # vuelva a tomar este lead mientras espera su turno, sin mentir que ya salió (eso lo
+    # confirma /outreach/mark_sent). Si es primer_contacto, guardamos el mensaje para que
+    # el futuro seguimiento pueda referenciarlo.
+    if tipo == 'primer_contacto':
+        execute(
+            """
+            UPDATE apollo_leads
+            SET outreach_intento_id = %s, estado = 'en_cola',
+                primer_contacto_asunto = %s, primer_contacto_cuerpo = %s
+            WHERE id = %s
+            """,
+            (intento_id, asunto_gemini, email_cuerpo, apollo_lead_id)
+        )
+    else:
+        execute(
+            "UPDATE apollo_leads SET outreach_intento_id = %s, estado = 'en_cola' WHERE id = %s",
+            (intento_id, apollo_lead_id)
+        )
     if matrix_context_id:
         increment_sent(matrix_context_id)
 
@@ -319,7 +385,7 @@ def mark_bounces(req: MarkBouncesRequest):
         )
 
         apollo_lead = fetch_one(
-            "SELECT id, email_secundario, outreach_intento_id FROM apollo_leads WHERE email = %s AND estado IN ('enviado', 'bounce')",
+            "SELECT id, email_secundario, outreach_intento_id FROM apollo_leads WHERE email = %s AND estado IN ('en_cola', 'contactado', 'seguimiento_enviado', 'bounce')",
             (email_clean,)
         )
         if apollo_lead:
