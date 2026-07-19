@@ -4,13 +4,10 @@ from typing import Optional
 from pydantic import BaseModel
 import httpx
 
-from config import get_settings
 from database import fetch_one, fetch_all, execute
 from services.matrix_selector import increment_sent
 
 router = APIRouter()
-settings = get_settings()
-IS_DEV = settings.environment == "development"
 
 
 class MarkSentRequest(BaseModel):
