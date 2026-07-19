@@ -259,6 +259,10 @@ def planner_batch(tipo: str = Query(default="primer_contacto", pattern="^(primer
         programado = datetime.combine(destino['fecha'], datetime.min.time()).replace(hour=14, minute=0)
         lead_dict = dict(lead)
         lead_dict['programado_para'] = programado.isoformat()
+        # Festivos futuros del país de ESTE lead — para que n8n pueda evitar proponer un horario
+        # de reunión en un día festivo en el país del lead (no solo festivos de Colombia). Ya están
+        # calculados arriba para decidir cuándo mandar el email — se reusan, sin llamadas extra.
+        lead_dict['festivos_pais'] = sorted(f for f in festivos.get(codigo, set()) if f >= hoy.isoformat())
         asignados.append(lead_dict)
 
     return {
