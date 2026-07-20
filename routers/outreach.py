@@ -367,17 +367,17 @@ def prepare_outreach_apollo(req: dict):
 @router.post("/mark_bounces")
 def mark_bounces(req: MarkBouncesRequest):
     """
-    Recibe una lista de emails que hicieron bounce según Gmail.
-    1. Marca outreach_intentos como bounce_hard.
-    2. Para leads Apollo: si tiene email_secundario → crea un nuevo intento REUSANDO el
-       asunto/cuerpo del intento original (ya generado por Gemini — no se regenera nada acá,
-       la matriz no participa en reintentos). Si no tiene secundario → sin_contacto.
+    Recibe una lista de emails que hicieron bounce según Gmail (Flujo 4 — Bounce Audit).
+    Marca outreach_intentos como bounce_hard y apollo_leads como 'bounce' -- estado terminal,
+    el lead queda quemado. Apollo no provee contacto secundario (ese campo era heredado del
+    diseño de leads_brutos, retirado el 2026-07-20 junto con la columna email_secundario) -- no
+    hay reintento automático. Reemplazar un lead quemado por otro es un flujo aparte (backlog),
+    no un retry acá.
     """
     if not req.email_destinos:
         return {"status": "ok", "marcados": 0}
 
     marcados = 0
-    reintentos_apollo = 0
     ahora = datetime.utcnow()
 
     for email in req.email_destinos:
@@ -394,48 +394,16 @@ def mark_bounces(req: MarkBouncesRequest):
             (ahora, email_clean)
         )
 
-        apollo_lead = fetch_one(
-            "SELECT id, email_secundario, outreach_intento_id FROM apollo_leads WHERE email = %s AND estado IN ('en_cola', 'contactado', 'seguimiento_enviado', 'bounce')",
+        execute(
+            "UPDATE apollo_leads SET estado = 'bounce' WHERE email = %s AND estado IN ('en_cola', 'contactado', 'seguimiento_enviado')",
             (email_clean,)
         )
-        if apollo_lead:
-            execute(
-                "UPDATE apollo_leads SET estado = 'bounce' WHERE id = %s",
-                (apollo_lead['id'],)
-            )
-            if apollo_lead['email_secundario']:
-                intento_original = fetch_one(
-                    "SELECT tipo, asunto, cuerpo FROM outreach_intentos WHERE id = %s",
-                    (apollo_lead['outreach_intento_id'],)
-                ) if apollo_lead['outreach_intento_id'] else None
-
-                if intento_original:
-                    execute(
-                        """
-                        INSERT INTO outreach_intentos
-                            (lead_id, tipo, email_destino, asunto, cuerpo, estado, programado_para)
-                        VALUES (NULL, %s, %s, %s, %s, 'pendiente', %s)
-                        """,
-                        (intento_original['tipo'], apollo_lead['email_secundario'],
-                         intento_original['asunto'], intento_original['cuerpo'], ahora)
-                    )
-                    execute(
-                        "UPDATE apollo_leads SET email = %s, estado = 'pendiente' WHERE id = %s",
-                        (apollo_lead['email_secundario'], apollo_lead['id'])
-                    )
-                    reintentos_apollo += 1
-            else:
-                execute(
-                    "UPDATE apollo_leads SET estado = 'sin_contacto' WHERE id = %s",
-                    (apollo_lead['id'],)
-                )
 
         marcados += 1
 
     return {
         "status": "ok",
         "marcados": marcados,
-        "reintentos_apollo": reintentos_apollo,
         "procesados": len(req.email_destinos),
     }
 
@@ -474,10 +442,10 @@ def mark_reply(req: MarkReplyRequest):
         SELECT id, outreach_intento_id, nombre_decisor, cargo, empresa, dominio, vertical,
                apollo_score, tech_stack_apollo, tech_stack_wappalyzer
         FROM apollo_leads
-        WHERE (email = %s OR email_secundario = %s)
+        WHERE email = %s
           AND estado IN ('en_cola', 'contactado', 'seguimiento_enviado')
         """,
-        (email_clean, email_clean)
+        (email_clean,)
     )
     if not lead:
         raise HTTPException(status_code=404, detail=f"Ningún lead contactado matchea el email {email_clean}")

@@ -114,7 +114,6 @@ class ApolloLeadIn(BaseModel):
     tech_stack_wappalyzer: Optional[str] = None
     stack_categoria: Optional[str] = None
     mensaje_intro: Optional[str] = None
-    email_secundario: Optional[str] = None
 
 
 @router.get("/check")
@@ -141,14 +140,14 @@ def create_apollo_lead(lead: ApolloLeadIn):
         INSERT INTO apollo_leads
             (apollo_id, nombre_decisor, cargo, email, linkedin_url, empresa, dominio,
              vertical, pais, ciudad, empleados, tech_stack_apollo, tech_stack_wappalyzer,
-             stack_categoria, mensaje_intro, email_secundario)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+             stack_categoria, mensaje_intro)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT (apollo_id) DO NOTHING
         RETURNING id
         """,
         (lead.apollo_id, lead.nombre_decisor, lead.cargo, lead.email, lead.linkedin_url,
          lead.empresa, lead.dominio, lead.vertical, lead.pais, lead.ciudad, lead.empleados,
-         lead.tech_stack_apollo, tech_wap, stack_cat, lead.mensaje_intro, lead.email_secundario)
+         lead.tech_stack_apollo, tech_wap, stack_cat, lead.mensaje_intro)
     )
     if not result:
         return {"status": "duplicate", "apollo_id": lead.apollo_id}
@@ -301,11 +300,11 @@ def update_apollo_estado(lead_id: int, estado: str, intento_id: Optional[int] = 
     """
     Actualiza el estado de un lead Apollo manualmente (uso administrativo/debug — el flujo normal
     lo maneja prepare_apollo/mark_sent/mark_bounces).
-    Estados válidos: pendiente | en_cola | contactado | seguimiento_enviado | bounce | reply | sin_contacto | descartado
+    Estados válidos: pendiente | en_cola | contactado | seguimiento_enviado | bounce | reply | descartado
     """
     estados_validos = {
         'pendiente', 'en_cola', 'contactado', 'seguimiento_enviado',
-        'bounce', 'reply', 'sin_contacto', 'descartado'
+        'bounce', 'reply', 'descartado'
     }
     if estado not in estados_validos:
         raise HTTPException(status_code=400, detail=f"Estado inválido. Válidos: {estados_validos}")
@@ -335,7 +334,6 @@ def apollo_stats():
             COUNT(*) FILTER (WHERE estado = 'seguimiento_enviado') AS seguimientos_enviados,
             COUNT(*) FILTER (WHERE estado = 'bounce') AS bounces,
             COUNT(*) FILTER (WHERE estado = 'reply') AS replies,
-            COUNT(*) FILTER (WHERE estado = 'sin_contacto') AS sin_contacto,
             COUNT(*) FILTER (WHERE estado = 'descartado') AS descartados,
             COUNT(*) FILTER (WHERE mensaje_intro IS NULL) AS sin_intro,
             COUNT(*) AS total
