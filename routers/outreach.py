@@ -1,6 +1,5 @@
 from fastapi import APIRouter, HTTPException, Query
 from datetime import datetime, timedelta
-from typing import Optional
 from pydantic import BaseModel
 import httpx
 
@@ -12,7 +11,6 @@ router = APIRouter()
 
 class MarkSentRequest(BaseModel):
     intento_id: int
-    instantly_id: Optional[str] = None  # deprecated — era para Instantly. Vacío desde la migración a Gmail API.
 
 
 class MarkBouncesRequest(BaseModel):
@@ -76,10 +74,10 @@ def mark_sent(req: MarkSentRequest):
     execute(
         """
         UPDATE outreach_intentos
-        SET estado = 'enviado', enviado_at = %s, instantly_id = %s
+        SET estado = 'enviado', enviado_at = %s
         WHERE id = %s
         """,
-        (ahora, req.instantly_id or '', req.intento_id)
+        (ahora, req.intento_id)
     )
 
     if intento['matrix_id']:
