@@ -1,10 +1,12 @@
 from fastapi import APIRouter, HTTPException, Query
 from datetime import datetime, timedelta
+from typing import Optional
 from pydantic import BaseModel
 import httpx
 
 from database import fetch_one, fetch_all, execute
 from services.matrix_selector import increment_sent
+from config import get_settings
 
 router = APIRouter()
 
@@ -15,6 +17,12 @@ class MarkSentRequest(BaseModel):
 
 class MarkBouncesRequest(BaseModel):
     email_destinos: list[str]  # lista de emails que hicieron bounce según Gmail
+
+
+class MarkReplyRequest(BaseModel):
+    email: str
+    asunto: Optional[str] = None
+    cuerpo: Optional[str] = None
 
 
 @router.get("/pending")
@@ -429,4 +437,119 @@ def mark_bounces(req: MarkBouncesRequest):
         "marcados": marcados,
         "reintentos_apollo": reintentos_apollo,
         "procesados": len(req.email_destinos),
+    }
+
+
+def _twenty_mutation(query: str, variables: dict) -> dict:
+    settings = get_settings()
+    resp = httpx.post(
+        f"{settings.twenty_api_url}/graphql",
+        headers={"Authorization": f"Bearer {settings.twenty_api_token}", "Content-Type": "application/json"},
+        json={"query": query, "variables": variables},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "errors" in data:
+        raise HTTPException(status_code=502, detail=f"Twenty GraphQL error: {data['errors']}")
+    return data["data"]
+
+
+@router.post("/mark_reply")
+def mark_reply(req: MarkReplyRequest):
+    """
+    Marca un lead Apollo como respondido y crea Company + Person + Opportunity (+ Note si viene
+    cuerpo) en Twenty CRM. Único lugar que crea registros en Twenty para leads de cold outreach —
+    así Twenty solo recibe leads con interacción real confirmada (filosofía documentada en
+    knowledge/comercial/twenty_modelo_datos.md: "no es una base de scraping"), nunca el universo
+    bruto de apollo_leads.
+
+    Si el email no matchea ningún lead contactado (en_cola/contactado/seguimiento_enviado),
+    devuelve 404 -- así Flujo 3 (Unibox) distingue una respuesta real de cualquier otra cosa que
+    le llegue a la bandeja de cold outreach (spam, publicidad, correos de terceros).
+    """
+    email_clean = req.email.strip().lower()
+    lead = fetch_one(
+        """
+        SELECT id, outreach_intento_id, nombre_decisor, cargo, empresa, dominio, vertical,
+               apollo_score, tech_stack_apollo, tech_stack_wappalyzer
+        FROM apollo_leads
+        WHERE (email = %s OR email_secundario = %s)
+          AND estado IN ('en_cola', 'contactado', 'seguimiento_enviado')
+        """,
+        (email_clean, email_clean)
+    )
+    if not lead:
+        raise HTTPException(status_code=404, detail=f"Ningún lead contactado matchea el email {email_clean}")
+
+    ahora = datetime.utcnow()
+    execute("UPDATE apollo_leads SET estado = 'reply' WHERE id = %s", (lead['id'],))
+    if lead['outreach_intento_id']:
+        execute(
+            "UPDATE outreach_intentos SET estado = 'respondio', respondio_at = %s WHERE id = %s",
+            (ahora, lead['outreach_intento_id'])
+        )
+
+    partes_nombre = (lead['nombre_decisor'] or '').strip().split(' ', 1)
+    first_name = partes_nombre[0] if partes_nombre else ''
+    last_name = partes_nombre[1] if len(partes_nombre) > 1 else ''
+
+    company_input = {
+        "name": lead['empresa'] or 'Lead sin nombre',
+        "companyType": "PROSPECT",
+        "leadScore": lead['apollo_score'] or 0,
+        "techStack": lead['tech_stack_apollo'] or lead['tech_stack_wappalyzer'] or '',
+    }
+    if lead['vertical']:
+        company_input["vertical"] = lead['vertical']
+    if lead['dominio']:
+        company_input["domainName"] = {"primaryLinkUrl": lead['dominio'], "primaryLinkLabel": ""}
+
+    company = _twenty_mutation(
+        "mutation CreateCompany($input: CompanyCreateInput!) { createCompany(data: $input) { id name } }",
+        {"input": company_input}
+    )["createCompany"]
+
+    person = _twenty_mutation(
+        "mutation CreatePerson($input: PersonCreateInput!) { createPerson(data: $input) { id } }",
+        {"input": {
+            "name": {"firstName": first_name, "lastName": last_name},
+            "emails": {"primaryEmail": email_clean},
+            "jobTitle": lead['cargo'] or '',
+            "companyId": company["id"],
+        }}
+    )["createPerson"]
+
+    opportunity = _twenty_mutation(
+        "mutation CreateOpportunity($input: OpportunityCreateInput!) { createOpportunity(data: $input) { id name stage } }",
+        {"input": {
+            "name": (lead['empresa'] or 'Lead') + " — Consultoría inicial",
+            "stage": "EN_CONTACTO",
+            "companyId": company["id"],
+            "pointOfContactId": person["id"],
+        }}
+    )["createOpportunity"]
+
+    if req.cuerpo:
+        note = _twenty_mutation(
+            "mutation CreateNote($input: NoteCreateInput!) { createNote(data: $input) { id } }",
+            {"input": {
+                "title": req.asunto or "Respondió al outreach",
+                "bodyV2": {"markdown": req.cuerpo},
+            }}
+        )["createNote"]
+        _twenty_mutation(
+            "mutation CreateNoteTarget($input: NoteTargetCreateInput!) { createNoteTarget(data: $input) { id } }",
+            {"input": {"noteId": note["id"], "targetOpportunityId": opportunity["id"]}}
+        )
+
+    return {
+        "status": "ok",
+        "apollo_lead_id": lead['id'],
+        "empresa": lead['empresa'],
+        "twenty": {
+            "company_id": company["id"],
+            "person_id": person["id"],
+            "opportunity_id": opportunity["id"],
+        },
     }
