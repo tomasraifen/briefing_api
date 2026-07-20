@@ -232,6 +232,7 @@ def planner_batch(tipo: str = Query(default="primer_contacto", pattern="^(primer
                 SELECT COUNT(*) FROM generate_series(contactado_at::date + 1, CURRENT_DATE, interval '1 day') d
                 WHERE EXTRACT(DOW FROM d) NOT IN (0, 6)
               ) >= {DIAS_HABILES_ANTES_SEGUIMIENTO}
+            ORDER BY apollo_score DESC NULLS LAST
             LIMIT 500
             """,
             ()
@@ -242,7 +243,9 @@ def planner_batch(tipo: str = Query(default="primer_contacto", pattern="^(primer
             SELECT id, apollo_id, nombre_decisor, cargo, email, empresa, vertical,
                    pais, ciudad, empleados, stack_categoria, tech_stack_apollo,
                    tech_stack_wappalyzer, company_brief, news_snippet, apollo_score_angulo
-            FROM apollo_leads WHERE estado = 'pendiente' LIMIT 500
+            FROM apollo_leads WHERE estado = 'pendiente'
+            ORDER BY apollo_score DESC NULLS LAST
+            LIMIT 500
             """,
             ()
         )
