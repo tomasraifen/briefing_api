@@ -498,6 +498,7 @@ def mark_reply(req: MarkReplyRequest):
             "stage": "EN_CONTACTO",
             "companyId": company["id"],
             "pointOfContactId": person["id"],
+            "origen": "Cold Outreach",
         }}
     )["createOpportunity"]
 
